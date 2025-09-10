@@ -45,7 +45,7 @@ class SafeLoRA:
         if self.config.select_layers_type == 'threshold':
             self.model, _ = self.projected_weighted(project_matrix, self.config.threshold, show_info=True)
         elif self.config.select_layers_type == 'number':
-            model, cos = self.projected_weighted(project_matrix, 0.3, show_info=False)
+            model, cos = self.projected_weighted(project_matrix, -1, show_info=False)
             thrs = numpy.sort(cos)[:self.config.num_proj_layers][-1]
             self.model, _ = self.projected_weighted(project_matrix, thrs, show_info=True)
         else:
