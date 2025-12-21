@@ -105,7 +105,7 @@ class SafeLoRA:
                         param.data =  W_new
                     else:
                         param.data = param_ori
-                    dist = 1 / (1+torch.norm(param.data.reshape(1,-1)-W.reshape(1,-1)))
+                    dist = 1 / (1+torch.norm(fW.reshape(1,-1)-ori.reshape(1,-1)))
 
                     dis.append(dist.item())
                     idx += 1
