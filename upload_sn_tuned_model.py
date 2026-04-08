@@ -6,9 +6,8 @@ Usage:
 
 Example:
 python upload_sn_tuned_model.py \
-    /home/gokms0509/SafeLoRA/safe_lora_models/llama3.2-3b-safe-lora-final \
+    /home/yonsei_jong/SafeLoRA/safe_lora_models/llama3.2-3b-safe-lora-final-20260408-151342 \
     --repo_id kmseong/Llama-3.2-3B-instruct-SafeLoRA \
-    -save_dtype bf16 \
     --hf_token 
 """
 
@@ -103,7 +102,7 @@ def _ensure_tokenizer_assets(path_for_upload, source_model_path, fallback_model_
     logger.info(f"✓ Tokenizer copied from fallback model: {fallback_model_name}")
 
 
-def _prepare_upload_model_path(model_path, base_model, token=None, save_dtype="fp16"):
+def _prepare_upload_model_path(model_path, base_model, token=None, save_dtype="bf16"):
     """If input is adapter-only, merge into full model and return merged temp path."""
     if not _is_adapter_dir(model_path):
         return model_path, None

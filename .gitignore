@@ -1,0 +1,23 @@
+# 모델 디렉토리
+safe_lora_models/
+finetuned_models/
+math_lora_only/
+math_lora_merged/
+
+# 캐시
+cache/
+__pycache__/
+*.pyc
+
+# 로그
+logs/
+wandb/
+
+# 데이터셋
+datasets/
+
+# HuggingFace 캐시
+*.safetensors
+*.bin
+*.pt
+*.pth

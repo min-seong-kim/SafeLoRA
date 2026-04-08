@@ -13,6 +13,7 @@
 # limitations under the License.
 
 from dataclasses import dataclass, field
+from typing import Optional
 
 
 @dataclass
@@ -31,6 +32,10 @@ class SafeLoRAConfig:
         metadata={"help": "The path of the aligned model for obtaining the aligned matrix"},
     )
 
+    hf_token: Optional[str] = field(
+        default=None,
+        metadata={"help": "Optional Hugging Face token for gated/private checkpoints."},
+    )
 
     select_layers_type: str = field(
         default="number",
@@ -53,8 +58,22 @@ class SafeLoRAConfig:
 
     )
 
+    use_approximation: bool = field(
+        default=True,
+        metadata={"help": "Use the fast approximation C = VV^T / ||V||_F instead of the exact projector."},
+    )
+
+    projection_eps: float = field(
+        default=1e-8,
+        metadata={"help": "Numerical stability epsilon for projection and cosine similarity."},
+    )
+
     def __post_init__(self):
         if self.base_model_path is None:
             raise ValueError("base_model_path cannot be None.")
         if self.aligned_model_path is None:
             raise ValueError("aligned_model_path cannot be None.")
+        if self.select_layers_type not in {"threshold", "number"}:
+            raise ValueError("select_layers_type must be either 'threshold' or 'number'.")
+        if self.select_layers_type == "number" and self.num_proj_layers < 0:
+            raise ValueError("num_proj_layers must be non-negative.")

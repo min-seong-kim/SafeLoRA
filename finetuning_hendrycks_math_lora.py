@@ -1,29 +1,31 @@
 """
-Hendrycks MATH 데이터셋을 사용하여 SN-Tuned 모델의 전체 파라미터(Full Parameter) 파인튜닝
+Hendrycks MATH 데이터셋을 사용하여 Instruct 모델을 LoRA로만 파인튜닝
 
-Instruct 모델 기준:
-- tokenizer.apply_chat_template 사용
-- user prompt는 labels=-100으로 마스킹
-- assistant response만 loss 계산
+비교 목적:
+- 데이터 전처리/마스킹은 finetuning_hendrycks_math_instruct.py와 동일
+- 학습 방식만 Full FT 대신 LoRA
+- SafeLoRA projection 단계는 없음
 
-Example Usage:
-python finetune_hendrycks_math_full_params.py \
-    --model_path meta-llama/Llama-3.2-3B-instruct \
-    --output_dir ./full_finetune_MATH_instruct 
+Example:
+python finetuning_hendrycks_math_lora.py \
+    --model_path meta-llama/Llama-3.2-3B-Instruct \
+    --output_dir ./math_lora_only \
+    --num_train_samples 10000
 """
 
 import argparse
+import json
+import logging
 import os
 import random
 import re
-import json
 from dataclasses import dataclass
-from typing import Dict, List
 from datetime import datetime
-import logging
+from typing import Dict, List, Optional
 
 import torch
-from datasets import load_dataset, concatenate_datasets
+from datasets import concatenate_datasets, load_dataset
+from peft import LoraConfig, TaskType, get_peft_model
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
@@ -33,8 +35,14 @@ from transformers import (
 )
 
 
+def _hf_auth_kwargs(token: Optional[str]) -> Dict[str, str]:
+    if not token:
+        return {}
+    return {"token": token}
+
+
 def parse_args():
-    p = argparse.ArgumentParser(description="Full Parameter Finetune SN-Tuned Model on Hendrycks MATH")
+    p = argparse.ArgumentParser(description="LoRA-only Hendrycks MATH fine-tuning")
 
     p.add_argument("--model_path", type=str, required=True, help="HuggingFace model ID or local path")
 
@@ -57,19 +65,29 @@ def parse_args():
     p.add_argument("--warmup_ratio", type=float, default=0.1)
     p.add_argument("--lr_scheduler_type", type=str, default="cosine")
     p.add_argument("--max_grad_norm", type=float, default=1.0)
-
     p.add_argument("--max_length", type=int, default=1024)
+
+    p.add_argument("--lora_r", type=int, default=8)
+    p.add_argument("--lora_alpha", type=int, default=16)
+    p.add_argument("--lora_dropout", type=float, default=0.05)
+    p.add_argument(
+        "--lora_target_modules",
+        type=str,
+        default="q_proj,k_proj,v_proj,up_proj,down_proj",
+        help="Comma-separated list of target modules",
+    )
 
     p.add_argument("--bf16", action="store_true", default=True)
     p.add_argument("--fp16", action="store_true", default=False)
-    p.add_argument("--gradient_checkpointing", action="store_true", default=False)
+    p.add_argument("--gradient_checkpointing", action="store_true", default=True)
 
-    p.add_argument("--output_dir", type=str, default="./math_sn_tune_full_finetune")
+    p.add_argument("--output_dir", type=str, default="./math_lora_only")
     p.add_argument("--logging_steps", type=int, default=10)
     p.add_argument("--eval_steps", type=int, default=500)
     p.add_argument("--report_to", type=str, default="none")
-    p.add_argument("--num_workers", type=int, default=4)
     p.add_argument("--cache_dir", type=str, default="./cache")
+    p.add_argument("--hf_token", type=str, default=None)
+    p.add_argument("--save_merged", action="store_true", help="Save a merged full model in addition to the adapter")
 
     return p.parse_args()
 
@@ -270,10 +288,10 @@ class DataCollatorForCausalLMWithPadding:
 
 
 def setup_logging():
-    log_dir = "./logs/safety_neuron_math"
+    log_dir = "./logs/math_lora_only"
     os.makedirs(log_dir, exist_ok=True)
     log_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    log_file = os.path.join(log_dir, f"finetune_math_{log_timestamp}.log")
+    log_file = os.path.join(log_dir, f"finetune_math_lora_{log_timestamp}.log")
 
     logger = logging.getLogger(__name__)
     logger.setLevel(logging.DEBUG)
@@ -298,17 +316,14 @@ def main():
     os.makedirs(args.output_dir, exist_ok=True)
     set_seed(args.seed)
 
-    raw_path = args.model_path
-    is_local = raw_path.startswith("./") or raw_path.startswith("/") or raw_path.startswith("../")
-    model_path = os.path.abspath(raw_path) if is_local else raw_path
-
+    model_path = args.model_path
     logger, log_file = setup_logging()
 
     logger.info(f"\n{'=' * 70}")
-    logger.info("  🚀 Full Parameter Hendrycks MATH Fine-tuning (SN-Tuned Model)")
+    logger.info("  🚀 LoRA-only Hendrycks MATH Fine-tuning")
     logger.info(f"{'=' * 70}\n")
     logger.info(f"Log file: {log_file}")
-    logger.info(f"⚙️  Configuration:")
+    logger.info("⚙️  Configuration:")
     logger.info(f"   ├─ Model: {model_path}")
     logger.info(f"   ├─ Input formatting: {'chat template' if is_instruct_model(model_path) else 'Question/Answer plain text'}")
     logger.info(f"   ├─ Subjects: {args.math_subjects}")
@@ -318,9 +333,11 @@ def main():
     logger.info(f"   ├─ Grad accum: {args.grad_accum}")
     logger.info(f"   ├─ Epochs: {args.epochs}")
     logger.info(f"   ├─ LR: {args.learning_rate}")
+    logger.info(f"   ├─ LoRA r/alpha/dropout: {args.lora_r}/{args.lora_alpha}/{args.lora_dropout}")
+    logger.info(f"   ├─ LoRA target modules: {args.lora_target_modules}")
     logger.info(f"   └─ Output dir: {args.output_dir}")
 
-    tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=False)
+    tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=False, **_hf_auth_kwargs(args.hf_token))
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token
 
@@ -330,11 +347,29 @@ def main():
         torch_dtype=dtype,
         device_map="auto",
         trust_remote_code=False,
+        **_hf_auth_kwargs(args.hf_token),
     )
+
+    target_modules = [m.strip() for m in args.lora_target_modules.split(",") if m.strip()]
+    lora_config = LoraConfig(
+        r=args.lora_r,
+        lora_alpha=args.lora_alpha,
+        lora_dropout=args.lora_dropout,
+        target_modules=target_modules,
+        bias="none",
+        task_type=TaskType.CAUSAL_LM,
+    )
+    model = get_peft_model(model, lora_config)
 
     if args.gradient_checkpointing:
         model.gradient_checkpointing_enable()
+        if hasattr(model, "enable_input_require_grads"):
+            model.enable_input_require_grads()
         model.config.use_cache = False
+
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    all_params = sum(p.numel() for p in model.parameters())
+    logger.info(f"Trainable params: {trainable_params:,} ({100 * trainable_params / all_params:.4f}%)")
 
     subject_to_config = {
         "Algebra": "algebra",
@@ -357,7 +392,12 @@ def main():
         datasets_per_subject = []
         for subject in subjects:
             config_name = subject_to_config[subject]
-            ds = load_dataset(args.math_official_dataset_path, config_name, split="train", cache_dir=args.cache_dir)
+            ds = load_dataset(
+                args.math_official_dataset_path,
+                config_name,
+                split="train",
+                cache_dir=args.cache_dir,
+            )
             ds = ds.map(lambda ex, subject=subject: {"type": subject})
             datasets_per_subject.append(ds)
         train_ds = concatenate_datasets(datasets_per_subject)
@@ -405,6 +445,7 @@ def main():
 
     data_collator = DataCollatorForCausalLMWithPadding(tokenizer)
     do_eval = eval_tok is not None
+
     training_args = TrainingArguments(
         output_dir=args.output_dir,
         num_train_epochs=args.epochs,
@@ -417,7 +458,7 @@ def main():
         lr_scheduler_type=args.lr_scheduler_type,
         max_grad_norm=args.max_grad_norm,
         logging_steps=args.logging_steps,
-        save_strategy="no",
+        save_strategy="epoch",
         eval_strategy=("steps" if do_eval else "no"),
         eval_steps=(args.eval_steps if do_eval else None),
         bf16=args.bf16,
@@ -438,15 +479,23 @@ def main():
         data_collator=data_collator,
     )
 
-    logger.info("Starting training...")
+    logger.info("Starting LoRA training...")
     trainer.train()
 
     trainer.save_model(args.output_dir)
     tokenizer.save_pretrained(args.output_dir)
 
+    if args.save_merged:
+        logger.info("Saving merged full model...")
+        merged_model = model.merge_and_unload()
+        merged_dir = os.path.join(args.output_dir, "merged")
+        os.makedirs(merged_dir, exist_ok=True)
+        merged_model.save_pretrained(merged_dir, safe_serialization=True)
+        tokenizer.save_pretrained(merged_dir)
+
     config = {
         "base_model": model_path,
-        "fine_tuning_type": "Full Parameter Fine-tuning",
+        "fine_tuning_type": "LoRA only",
         "dataset": "Hendrycks MATH",
         "math_dataset_source": args.math_dataset_source,
         "math_subjects": args.math_subjects,
@@ -466,14 +515,17 @@ def main():
         "dtype": "bf16" if args.bf16 else ("fp16" if args.fp16 else "fp32"),
         "input_formatting": "chat template" if is_instruct_model(model_path) else "Question/Answer plain text",
         "prompt_masking": "assistant-only loss",
+        "lora_r": args.lora_r,
+        "lora_alpha": args.lora_alpha,
+        "lora_dropout": args.lora_dropout,
+        "lora_target_modules": target_modules,
+        "trainable_params": trainable_params,
+        "all_params": all_params,
     }
+    with open(os.path.join(args.output_dir, "lora_math_config.json"), "w", encoding="utf-8") as f:
+        json.dump(config, f, indent=2, ensure_ascii=False)
 
-    config_path = os.path.join(args.output_dir, "finetune_config.json")
-    with open(config_path, "w") as f:
-        json.dump(config, f, indent=2)
-
-    logger.info(f"✅ Fine-tuned model saved to {args.output_dir}")
-    logger.info(f"✅ Config saved to {config_path}")
+    logger.info("✅ LoRA-only fine-tuning finished.")
 
 
 if __name__ == "__main__":
