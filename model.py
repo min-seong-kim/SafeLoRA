@@ -42,11 +42,27 @@ class SafeLoRA:
         self.module_metrics = self._compute_module_metrics()
         self.selected_modules = self._select_modules()
         self.model = self._apply_projection()
+        sorted_metrics = sorted(
+            (
+                {
+                    "module": module_name,
+                    "selected": module_name in set(self.selected_modules),
+                    **metric,
+                }
+                for module_name, metric in self.module_metrics.items()
+            ),
+            key=lambda item: item["cosine"],
+        )
         self.stats = {
             "selected_modules": self.selected_modules,
             "metrics": self.module_metrics,
+            "sorted_metrics": sorted_metrics,
             "num_projected_layers": len(self.selected_modules),
             "num_candidate_layers": len(self.module_metrics),
+            "selection_mode": self.config.select_layers_type,
+            "threshold": self.config.threshold,
+            "num_proj_layers": self.config.num_proj_layers,
+            "use_approximation": self.config.use_approximation,
         }
 
     def _clone_lora_params(self) -> Dict[str, torch.Tensor]:
@@ -233,4 +249,14 @@ class SafeLoRA:
             f"{len(self.selected_modules)} / {len(self.module_metrics)} LoRA layers projected "
             f"using {selection_desc}; mean cosine={mean_cos:.4f}."
         )
+        if self.selected_modules:
+            print("Selected modules (lowest cosine first):")
+            for module_name in self.selected_modules:
+                metric = self.module_metrics[module_name]
+                print(
+                    f"  - {module_name}: cosine={metric['cosine']:.6f}, "
+                    f"delta_shift={metric['delta_shift']:.6f}, projector={metric['projector_key']}"
+                )
+        else:
+            print("No LoRA modules were selected for projection.")
         return self.peft_model

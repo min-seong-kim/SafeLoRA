@@ -9,25 +9,16 @@ Safe LoRA 모델 생성 스크립트 (1, 2, 3단계)
 python safe_lora_training.py \
     --base-model meta-llama/Llama-3.2-3B \
     --aligned-model meta-llama/Llama-3.2-3B-Instruct \
-    --dataset-source official \
-    --official-dataset-path EleutherAI/hendrycks_math \
     --math-subjects all \
     --math-levels all \
-    --train-on-mixed-formats \
     --train-split train \
     --num-train-samples 10000 \
     --max-length 1024 \
-    --batch-size 4 \
-    --grad-accum-steps 4 \
-    --epochs 3 \
-    --lr 3e-5 \
-    --max-grad-norm 1.0 \
-    --warmup-ratio 0.1 \
-    --max-steps -1 \
     --safe-num-layers 12 \
-    --safe-threshold 0.15 \
+    --safe-threshold 0.5 \
+    --safe-select-type threshold \
     --use-chat-template \
-    --hf-token YOUR_HF_TOKEN
+    --system-prompt "" \
 """
 
 import os
@@ -77,12 +68,18 @@ ALIGNED_MODEL_PATH = "meta-llama/Llama-3.2-3B-Instruct"
 OUTPUT_LORA_PATH = BASE_PROJECT_DIR / "finetuned_models" / "math-llama3.2-3b-peft"
 RUN_TIMESTAMP = datetime.now().strftime("%Y%m%d-%H%M%S")
 SAFE_LORA_OUTPUT_PATH = BASE_PROJECT_DIR / "safe_lora_models" / f"llama3.2-3b-safe-lora-final-{RUN_TIMESTAMP}"
+SAFE_LORA_LOG_DIR = BASE_PROJECT_DIR / "logs"
+SAFE_LORA_SELECTION_LOG_PATH = SAFE_LORA_LOG_DIR / f"safe_lora_selection_{RUN_TIMESTAMP}.json"
+SAFE_LORA_SELECTION_TEXT_LOG_PATH = SAFE_LORA_LOG_DIR / f"safe_lora_selection_{RUN_TIMESTAMP}.txt"
 
 # 경로를 문자열로 변환
 BASE_MODEL_PATH = str(BASE_MODEL_PATH)
 ALIGNED_MODEL_PATH = str(ALIGNED_MODEL_PATH)
 OUTPUT_LORA_PATH = str(OUTPUT_LORA_PATH)
 SAFE_LORA_OUTPUT_PATH = str(SAFE_LORA_OUTPUT_PATH)
+SAFE_LORA_LOG_DIR = str(SAFE_LORA_LOG_DIR)
+SAFE_LORA_SELECTION_LOG_PATH = str(SAFE_LORA_SELECTION_LOG_PATH)
+SAFE_LORA_SELECTION_TEXT_LOG_PATH = str(SAFE_LORA_SELECTION_TEXT_LOG_PATH)
 
 # LoRA 설정 (Llama 3.2 3B 최적화)
 LORA_R = 8                                           # 더 작은 모델이므로 rank 축소
@@ -90,7 +87,8 @@ LORA_ALPHA = 16                                      # alpha도 축소
 LORA_DROPOUT = 0.05
 # Llama 3.2의 projection layers
 # LORA_TARGET_MODULES = ["q_proj", "k_proj", "v_proj", "up_proj", "down_proj"]
-LORA_TARGET_MODULES = ["q_proj", "v_proj"]
+# 원본은 q,v만 사용
+LORA_TARGET_MODULES = ["q_proj", "k_proj", "v_proj", "up_proj", "down_proj"]
 
 # 학습 설정 (SFT와 유사하게 정렬)
 BATCH_SIZE = 4
@@ -142,6 +140,41 @@ SAFE_LORA_USE_APPROXIMATION = True
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 HF_TOKEN = None
+
+
+def write_safe_lora_selection_logs(stats: Dict, metadata: Dict) -> None:
+    os.makedirs(SAFE_LORA_LOG_DIR, exist_ok=True)
+
+    json_payload = {
+        "run_timestamp": RUN_TIMESTAMP,
+        "metadata": metadata,
+        "stats": stats,
+    }
+    with open(SAFE_LORA_SELECTION_LOG_PATH, "w", encoding="utf-8") as f:
+        json.dump(json_payload, f, indent=2, ensure_ascii=False)
+
+    sorted_metrics = stats.get("sorted_metrics", [])
+    selected_modules = set(stats.get("selected_modules", []))
+    with open(SAFE_LORA_SELECTION_TEXT_LOG_PATH, "w", encoding="utf-8") as f:
+        f.write(f"SafeLoRA selection log\n")
+        f.write(f"run_timestamp: {RUN_TIMESTAMP}\n")
+        for key, value in metadata.items():
+            f.write(f"{key}: {value}\n")
+        f.write(f"num_candidate_layers: {stats.get('num_candidate_layers')}\n")
+        f.write(f"num_projected_layers: {stats.get('num_projected_layers')}\n")
+        f.write(f"selection_mode: {stats.get('selection_mode')}\n")
+        f.write(f"threshold: {stats.get('threshold')}\n")
+        f.write(f"num_proj_layers: {stats.get('num_proj_layers')}\n")
+        f.write(f"use_approximation: {stats.get('use_approximation')}\n")
+        f.write("\nPer-layer metrics\n")
+        for idx, item in enumerate(sorted_metrics, start=1):
+            marker = "[SELECTED]" if item["module"] in selected_modules else "[SKIPPED]"
+            f.write(
+                f"{idx:03d} {marker} module={item['module']} "
+                f"cosine={item['cosine']:.6f} "
+                f"delta_shift={item['delta_shift']:.6f} "
+                f"projector={item['projector_key']}\n"
+            )
 
 
 def _hf_auth_kwargs(token: Optional[str]) -> Dict[str, str]:
@@ -328,21 +361,23 @@ def tokenize_question_answer_example(
     max_length: int,
     use_chat_template: bool,
     add_eos: bool = True,
+    system_prompt: str = "",
 ):
     question = str(question).strip()
     response = str(response).strip()
 
     if use_chat_template:
+        messages = []
+        if system_prompt:
+            messages.append({"role": "system", "content": system_prompt})
+        messages.append({"role": "user", "content": question})
         prompt_text = tokenizer.apply_chat_template(
-            [{"role": "user", "content": question}],
+            messages,
             tokenize=False,
             add_generation_prompt=True,
         )
         full_text = tokenizer.apply_chat_template(
-            [
-                {"role": "user", "content": question},
-                {"role": "assistant", "content": response},
-            ],
+            messages + [{"role": "assistant", "content": response}],
             tokenize=False,
             add_generation_prompt=False,
         )
@@ -434,6 +469,7 @@ def tokenize_and_mask_math(
         target_text,
         max_length=max_length,
         use_chat_template=effective_chat_template,
+        system_prompt=system_prompt,
     )
 
 
@@ -866,6 +902,21 @@ def step3_apply_safe_lora(models_dict, tokenizer):
         safelora = SafeLoRA(peft_model, config)
         safe_model = safelora.model
         print(f"✓ SafeLoRA 적용 완료 (안전성 보존됨)")
+        selection_metadata = {
+            "base_model": BASE_MODEL_PATH,
+            "aligned_model": ALIGNED_MODEL_PATH,
+            "lora_output_path": OUTPUT_LORA_PATH,
+            "safe_lora_output_path": SAFE_LORA_OUTPUT_PATH,
+            "target_modules": LORA_TARGET_MODULES,
+            "select_type": SAFE_LORA_SELECT_TYPE,
+            "safe_threshold": SAFE_LORA_THRESHOLD,
+            "safe_num_layers": SAFE_LORA_NUM_LAYERS,
+            "device": DEVICE,
+        }
+        write_safe_lora_selection_logs(safelora.stats, selection_metadata)
+        print("✓ SafeLoRA selected-layer 로그 저장 완료")
+        print(f"  JSON: {SAFE_LORA_SELECTION_LOG_PATH}")
+        print(f"  TEXT: {SAFE_LORA_SELECTION_TEXT_LOG_PATH}")
     except Exception as e:
         print(f"⚠ SafeLoRA 적용 실패: {e}")
         print(f"💡 다음을 확인하세요:")
@@ -957,7 +1008,7 @@ def main():
     global DATASET_SOURCE, OFFICIAL_DATASET_PATH, FLAT_DATASET_PATH, MATH_SUBJECTS, MATH_LEVELS
     global TRAIN_ON_MIXED_FORMATS, USE_CHAT_TEMPLATE
     global BATCH_SIZE, GRAD_ACCUM_STEPS, NUM_EPOCHS, LEARNING_RATE, MAX_GRAD_NORM, WARMUP_RATIO, MAX_STEPS
-    global SAFE_LORA_NUM_LAYERS, SAFE_LORA_THRESHOLD, SAFE_LORA_USE_APPROXIMATION
+    global SAFE_LORA_NUM_LAYERS, SAFE_LORA_THRESHOLD, SAFE_LORA_USE_APPROXIMATION, SAFE_LORA_SELECT_TYPE
     global HF_TOKEN
     
     # 명령줄 인자 파서
@@ -1003,6 +1054,7 @@ def main():
     parser.add_argument("--max-steps", type=int, default=MAX_STEPS, help="Max steps (-1이면 epoch 기준)")
     parser.add_argument("--safe-num-layers", type=int, default=SAFE_LORA_NUM_LAYERS, help="SafeLoRA 투영 레이어 수")
     parser.add_argument("--safe-threshold", type=float, default=SAFE_LORA_THRESHOLD, help="SafeLoRA cosine threshold")
+    parser.add_argument("--safe-select-type", type=str, default=SAFE_LORA_SELECT_TYPE, choices=["threshold", "number"], help="SafeLoRA 레이어 선택 방식 (threshold: cosine 기준, number: 고정 개수 기준)")
     parser.add_argument(
         "--safe-use-exact-projection",
         action="store_true",
@@ -1042,6 +1094,7 @@ def main():
     SAFE_LORA_NUM_LAYERS = args.safe_num_layers
     SAFE_LORA_THRESHOLD = args.safe_threshold
     SAFE_LORA_USE_APPROXIMATION = not args.safe_use_exact_projection
+    SAFE_LORA_SELECT_TYPE = args.safe_select_type
     HF_TOKEN = args.hf_token or os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_TOKEN")
     
     print("\n" + "="*80)
