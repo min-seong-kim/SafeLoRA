@@ -2,7 +2,7 @@
 LoRA adapter를 base 모델에 merge하여 full model로 저장합니다.
 
 사용법:
-    python merge_lora.py --adapter_path ./safe_lora_models/llama3.2-3b-safe-lora-final-20260409-215714
+    python merge_lora.py --adapter_path ./safe_lora_models/llama2-7b-safe-lora-gsm8k-20260424-223126
     python merge_lora.py --adapter_path ./math_lora_only
 """
 import argparse

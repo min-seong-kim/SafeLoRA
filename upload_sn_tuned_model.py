@@ -6,9 +6,8 @@ Usage:
 
 Example:
 python upload_sn_tuned_model.py \
-    /home/yonsei_jong/SafeLoRA/safe_lora_models/llama3.2-3b-safe-lora-final-20260409-201843_merge \
-    --repo_id kmseong/Llama-3.2-3B-instruct-SafeLoRA-MATH-2666 \
-    --hf_token 
+    /home/yonsei_jong/SafeLoRA/safe_lora_models/llama2-7b-safe-lora-gsm8k-20260424-223126_merge \
+    --repo_id kmseong/Llama-2-7B-base-SafeLoRA-gsm8k-lr3e-3 
 """
 
 import argparse
